@@ -20,10 +20,9 @@ def test_open_and_close_long_position_realizes_pnl(broker: PaperBroker):
     assert broker.get_open_position() is None
 
 
-def test_short_position_profits_when_price_falls(broker: PaperBroker):
-    broker.open_position("short", units=5, price=2000, stop_loss=2010, take_profit=1980)
-    trade = broker.close_position(price=1980, reason="take_profit hit")
-    assert trade.pnl == pytest.approx(100.0)
+def test_opening_short_is_rejected_long_only_spot_broker(broker: PaperBroker):
+    with pytest.raises(ValueError):
+        broker.open_position("short", units=5, price=2000, stop_loss=2010, take_profit=1980)
 
 
 def test_check_stop_take_closes_long_on_stop_loss(broker: PaperBroker):

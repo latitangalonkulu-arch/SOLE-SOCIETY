@@ -1,5 +1,6 @@
-"""Main polling loop: fetch bars -> strategy signal -> risk check -> broker
-order -> journal + push notification. Runs forever until interrupted.
+"""Main polling loop: fetch bars -> strategy signal -> pre-trade filter ->
+risk check -> broker order -> journal + push notification. Runs forever
+until interrupted.
 """
 from __future__ import annotations
 
@@ -12,8 +13,9 @@ from gold_bot.config import AppConfig
 from gold_bot.data_feed import PriceFeed
 from gold_bot.journal import TradeJournal
 from gold_bot.notifier import FanoutNotifier
+from gold_bot.pretrade_filter import PreTradeFilter
 from gold_bot.risk import RiskManager
-from gold_bot.strategy import Action, EmaRsiAtrStrategy
+from gold_bot.strategy import Action, EmaAtrStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +34,16 @@ class TradingEngine:
         self.broker = broker
         self.notifier = notifier
         self.journal = journal
-        self.strategy = EmaRsiAtrStrategy(cfg.strategy)
+        self.strategy = EmaAtrStrategy(cfg.strategy)
         self.risk = RiskManager(cfg.risk)
+        self.pretrade_filter = PreTradeFilter(cfg.pretrade_filter) if cfg.pretrade_filter.enabled else None
 
     def run_forever(self) -> None:
         self.notifier.send(
             "Gold bot started",
             f"Symbol: {self.cfg.symbol.display_name} | Broker: {self.cfg.broker.backend} | "
-            f"Poll: {self.cfg.engine.poll_interval_seconds}s",
+            f"Poll: {self.cfg.engine.poll_interval_seconds}s | "
+            f"Pre-trade filter: {'on' if self.pretrade_filter else 'off'}",
         )
         while True:
             try:
@@ -65,6 +69,7 @@ class TradingEngine:
         signal = self.strategy.generate_signal(df, current_side)
 
         if signal.action == Action.EXIT and position is not None:
+            # Exits are never gated by the pre-trade filter — only entries are.
             trade = self.broker.close_position(signal.price, signal.reason)
             if trade:
                 self.journal.record(trade)
@@ -72,15 +77,39 @@ class TradingEngine:
             return
 
         if signal.action in (Action.ENTER_LONG, Action.ENTER_SHORT):
-            side = "long" if signal.action == Action.ENTER_LONG else "short"
-            equity = self.broker.get_equity()
-            open_count = 1 if self.broker.get_open_position() else 0
-            sizing = self.risk.size_position(equity, signal.price, signal.stop_loss, open_count)
-            if not sizing.allowed:
-                logger.info("Signal %s rejected by risk manager: %s", side, sizing.reason)
+            self._try_enter(signal, df)
+
+    def _try_enter(self, signal, df) -> None:
+        side = "long" if signal.action == Action.ENTER_LONG else "short"
+
+        if side == "short" and not self.broker.supports_short:
+            logger.info("Short signal skipped: %s does not support shorting", type(self.broker).__name__)
+            return
+
+        if self.pretrade_filter is not None:
+            higher_df = self.feed.get_bars(
+                max(self.cfg.engine.lookback_bars, self.pretrade_filter.min_higher_tf_bars_required()),
+                self.cfg.pretrade_filter.higher_timeframe,
+            )
+            result = self.pretrade_filter.evaluate(df, higher_df, side)
+            if not result.passed:
+                reasons = "; ".join(result.reasons())
+                logger.info("Entry signal rejected by pre-trade filter: %s", reasons)
+                self.notifier.send(
+                    f"Signal skipped ({side}) {self.cfg.symbol.display_name}",
+                    f"Pre-trade filter failed:\n{reasons}",
+                )
                 return
-            pos = self.broker.open_position(side, sizing.units, signal.price, signal.stop_loss, signal.take_profit)
-            self._notify_opened(pos, signal.reason)
+
+        equity = self.broker.get_equity()
+        open_count = 1 if self.broker.get_open_position() else 0
+        sizing = self.risk.size_position(equity, signal.price, signal.stop_loss, open_count)
+        if not sizing.allowed:
+            logger.info("Signal %s rejected by risk manager: %s", side, sizing.reason)
+            return
+
+        pos = self.broker.open_position(side, sizing.units, signal.price, signal.stop_loss, signal.take_profit)
+        self._notify_opened(pos, signal.reason)
 
     def _notify_opened(self, pos, reason: str) -> None:
         self.notifier.send(
@@ -91,31 +120,32 @@ class TradingEngine:
         )
 
     def _notify_closed(self, trade) -> None:
-        emoji_reason = trade.reason
         self.notifier.send(
             f"Closed {trade.side.upper()} {self.cfg.symbol.display_name} ({'WIN' if trade.pnl > 0 else 'LOSS'})",
             f"Entry: {trade.entry_price:.2f} -> Exit: {trade.exit_price:.2f}\n"
-            f"P&L: {trade.pnl:+.2f}\nReason: {emoji_reason}",
+            f"P&L: {trade.pnl:+.2f}\nReason: {trade.reason}",
             priority="high",
         )
 
 
 def build_engine(cfg: AppConfig, project_root: Path) -> TradingEngine:
-    from gold_bot.broker.paper import PaperBroker
-    from gold_bot.data_feed import YFinanceFeed
+    from gold_bot.data_feed import CCXTFeed
     from gold_bot.notifier import build_notifiers
 
-    feed = YFinanceFeed(cfg.symbol.yfinance_ticker)
+    feed = CCXTFeed(cfg.symbol.exchange_id, cfg.symbol.symbol)
 
-    if cfg.broker.backend == "mt5":
-        from gold_bot.broker.mt5 import MT5Broker
-        from gold_bot.data_feed import MT5Feed
+    if cfg.broker.backend == "ccxt":
+        from gold_bot.broker.ccxt_broker import CCXTBroker
 
-        if not all([cfg.broker.mt5_login, cfg.broker.mt5_password, cfg.broker.mt5_server, cfg.broker.mt5_symbol]):
-            raise RuntimeError("BROKER=mt5 requires MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_SYMBOL in .env")
-        broker = MT5Broker(cfg.broker.mt5_login, cfg.broker.mt5_password, cfg.broker.mt5_server, cfg.broker.mt5_symbol)
-        feed = MT5Feed(cfg.broker.mt5_symbol)
+        broker = CCXTBroker(
+            cfg.symbol.exchange_id, cfg.symbol.symbol,
+            project_root / "data" / "ccxt_state.json",
+            api_key=cfg.broker.ccxt_api_key, api_secret=cfg.broker.ccxt_api_secret,
+            api_password=cfg.broker.ccxt_api_password,
+        )
     elif cfg.broker.backend == "paper":
+        from gold_bot.broker.paper import PaperBroker
+
         broker = PaperBroker(cfg.broker.paper_starting_balance, project_root / "data" / "paper_state.json")
     else:
         raise RuntimeError(f"Unknown BROKER backend: {cfg.broker.backend}")

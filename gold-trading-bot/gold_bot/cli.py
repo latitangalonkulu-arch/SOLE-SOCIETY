@@ -7,19 +7,28 @@ from pathlib import Path
 
 from gold_bot.config import PROJECT_ROOT, load_config
 
+# ccxt's single fetch_ohlcv call is capped by the exchange (commonly
+# ~1000 candles); good enough to sanity-check the strategy + filter, not
+# a substitute for a dedicated historical-data pipeline.
+MAX_BACKTEST_BARS = 1000
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="gold-bot", description="Gold (XAU/USD) trading bot")
+    parser = argparse.ArgumentParser(prog="gold-bot", description="Gold/PAXG trading bot")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="Run the live/paper trading loop")
     run_p.add_argument("--live", action="store_true",
-                        help="Required in addition to BROKER=mt5 in .env to actually place live orders. "
-                             "Without this flag, BROKER=mt5 is refused as a safety check.")
+                        help="Required in addition to BROKER=ccxt in .env to actually place live orders. "
+                             "Without this flag, BROKER=ccxt is refused as a safety check.")
 
-    backtest_p = sub.add_parser("backtest", help="Backtest the strategy over historical data")
-    backtest_p.add_argument("--period", default="60d", help="yfinance period, e.g. 30d, 60d, 1y")
-    backtest_p.add_argument("--interval", default=None, help="Bar interval, defaults to config.yaml's engine.bar_interval")
+    backtest_p = sub.add_parser("backtest", help="Backtest the strategy + pre-trade filter over historical data")
+    backtest_p.add_argument("--bars", type=int, default=MAX_BACKTEST_BARS,
+                             help=f"Number of entry-timeframe bars to fetch (max {MAX_BACKTEST_BARS})")
+    backtest_p.add_argument("--interval", default=None,
+                             help="Entry-timeframe bar interval, defaults to config.yaml's engine.bar_interval")
+    backtest_p.add_argument("--no-filter", action="store_true",
+                             help="Disable the pre-trade filter for this backtest run, to compare against")
 
     sub.add_parser("status", help="Show current position and trade history summary")
 
@@ -29,9 +38,9 @@ def main() -> None:
     cfg = load_config()
 
     if args.command == "run":
-        if cfg.broker.backend == "mt5" and not args.live:
+        if cfg.broker.backend == "ccxt" and not args.live:
             print(
-                "Refusing to start: BROKER=mt5 in .env but --live was not passed.\n"
+                "Refusing to start: BROKER=ccxt in .env but --live was not passed.\n"
                 "This is a deliberate safety check before the bot can place real orders.\n"
                 "Re-run as: python -m gold_bot.cli run --live",
                 file=sys.stderr,
@@ -43,23 +52,38 @@ def main() -> None:
         engine.run_forever()
 
     elif args.command == "backtest":
-        import yfinance as yf
-
         from gold_bot.backtest import run_backtest
-        from gold_bot.strategy import EmaRsiAtrStrategy
+        from gold_bot.data_feed import CCXTFeed
+        from gold_bot.pretrade_filter import PreTradeFilter
+        from gold_bot.strategy import EmaAtrStrategy
 
         interval = args.interval or cfg.engine.bar_interval
-        df = yf.Ticker(cfg.symbol.yfinance_ticker).history(period=args.period, interval=interval)
-        df = df.rename(columns=str.lower)[["open", "high", "low", "close"]]
+        bars = min(args.bars, MAX_BACKTEST_BARS)
+
+        feed = CCXTFeed(cfg.symbol.exchange_id, cfg.symbol.symbol)
+        df = feed.get_bars(bars, interval)
         if df.empty:
-            print("No historical data returned; try a shorter period or a daily interval.", file=sys.stderr)
+            print("No historical data returned.", file=sys.stderr)
             sys.exit(1)
 
-        strategy = EmaRsiAtrStrategy(cfg.strategy)
-        result = run_backtest(df, strategy, cfg.broker.paper_starting_balance, cfg.risk.risk_per_trade)
-        print(f"Bars: {len(df)} | Period: {args.period} | Interval: {interval}")
+        strategy = EmaAtrStrategy(cfg.strategy)
+
+        pretrade_filter = None
+        higher_tf_df = None
+        if cfg.pretrade_filter.enabled and not args.no_filter:
+            pretrade_filter = PreTradeFilter(cfg.pretrade_filter)
+            higher_tf_df = feed.get_bars(bars, cfg.pretrade_filter.higher_timeframe)
+
+        result = run_backtest(
+            df, strategy, cfg.broker.paper_starting_balance, cfg.risk.risk_per_trade,
+            allow_short=False,  # PAXG is spot/long-only on most exchanges
+            pretrade_filter=pretrade_filter, higher_tf_df=higher_tf_df,
+        )
+        print(f"Bars: {len(df)} | Interval: {interval} | Pre-trade filter: {'on' if pretrade_filter else 'off'}")
         print(f"Trades: {result.trades} | Wins: {result.wins} | Losses: {result.losses} | Win rate: {result.win_rate:.1%}")
         print(f"Total P&L: {result.total_pnl:+.2f} | Max drawdown: {result.max_drawdown:.1%}")
+        if pretrade_filter:
+            print(f"Entry signals rejected by filter: {result.filtered_out}")
 
     elif args.command == "status":
         from gold_bot.journal import TradeJournal

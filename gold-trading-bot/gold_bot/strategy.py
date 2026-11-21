@@ -1,5 +1,10 @@
-"""Entry/exit signal generation: EMA trend crossover, filtered by RSI,
-with ATR-based stop-loss / take-profit distances.
+"""Entry/exit signal generation: EMA trend crossover decides direction,
+ATR decides stop-loss/take-profit distance.
+
+Deliberately does NOT gate entries on RSI/trend/volume here — that's the
+pre-trade filter's job (gold_bot/pretrade_filter.py), kept as a separate,
+independently-tunable confirmation layer applied by the engine right
+before an order is placed. Exits are never gated by that filter.
 
 Indicators are implemented directly on pandas (no TA-Lib dependency, which
 is awkward to install on a phone-adjacent/cloud box).
@@ -55,18 +60,18 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-class EmaRsiAtrStrategy:
-    """Long when fast EMA crosses above slow EMA and RSI isn't overbought.
-    Short when fast EMA crosses below slow EMA and RSI isn't oversold.
-    Exit an open position on the opposite crossover (SL/TP are enforced by
-    the broker/engine between polls, not by this function).
+class EmaAtrStrategy:
+    """Long when fast EMA crosses above slow EMA; short on the opposite
+    crossover. Exit an open position on the opposite crossover (stop-loss/
+    take-profit are enforced by the broker/engine between polls, not by
+    this function).
     """
 
     def __init__(self, cfg: StrategyConfig):
         self.cfg = cfg
 
     def min_bars_required(self) -> int:
-        return max(self.cfg.slow_ema, self.cfg.rsi_period, self.cfg.atr_period) + 2
+        return max(self.cfg.slow_ema, self.cfg.atr_period) + 2
 
     def generate_signal(self, df: pd.DataFrame, current_side: str | None) -> Signal:
         """`current_side` is "long", "short", or None for flat."""
@@ -76,13 +81,11 @@ class EmaRsiAtrStrategy:
 
         fast = ema(df["close"], c.fast_ema)
         slow = ema(df["close"], c.slow_ema)
-        rsi_vals = rsi(df["close"], c.rsi_period)
         atr_vals = atr(df, c.atr_period)
 
         price = float(df["close"].iloc[-1])
         fast_now, fast_prev = fast.iloc[-1], fast.iloc[-2]
         slow_now, slow_prev = slow.iloc[-1], slow.iloc[-2]
-        rsi_now = rsi_vals.iloc[-1]
         atr_now = atr_vals.iloc[-1]
 
         crossed_up = fast_prev <= slow_prev and fast_now > slow_now
@@ -94,15 +97,15 @@ class EmaRsiAtrStrategy:
             return Signal(Action.EXIT, price=price, reason="EMA crossed up, exiting short")
 
         if current_side is None:
-            if crossed_up and rsi_now < c.rsi_overbought:
+            if crossed_up:
                 sl = price - atr_now * c.stop_loss_atr_mult
                 tp = price + atr_now * c.take_profit_atr_mult
                 return Signal(Action.ENTER_LONG, price=price, stop_loss=sl, take_profit=tp,
-                              reason=f"EMA({c.fast_ema}) crossed above EMA({c.slow_ema}), RSI={rsi_now:.1f}")
-            if crossed_down and rsi_now > c.rsi_oversold:
+                              reason=f"EMA({c.fast_ema}) crossed above EMA({c.slow_ema})")
+            if crossed_down:
                 sl = price + atr_now * c.stop_loss_atr_mult
                 tp = price - atr_now * c.take_profit_atr_mult
                 return Signal(Action.ENTER_SHORT, price=price, stop_loss=sl, take_profit=tp,
-                              reason=f"EMA({c.fast_ema}) crossed below EMA({c.slow_ema}), RSI={rsi_now:.1f}")
+                              reason=f"EMA({c.fast_ema}) crossed below EMA({c.slow_ema})")
 
         return Signal(Action.HOLD, price=price, reason="no new signal")

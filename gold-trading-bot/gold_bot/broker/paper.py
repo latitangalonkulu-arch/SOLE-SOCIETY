@@ -1,18 +1,23 @@
 """Simulated broker for paper trading: no real orders, just bookkeeping
 against a virtual balance, persisted to a JSON file so state survives
 restarts.
+
+Long/flat only, mirroring CCXTBroker's spot constraint — paper trading is
+meant to validate exactly what live trading will actually be able to do.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from gold_bot.broker.base import Broker, ClosedTrade, Position
+from gold_bot.broker.state import position_from_dict, position_to_dict
 
 
 class PaperBroker(Broker):
+    supports_short = False
+
     def __init__(self, starting_balance: float, state_path: Path):
         self.state_path = state_path
         self._balance = starting_balance
@@ -25,20 +30,13 @@ class PaperBroker(Broker):
             return
         data = json.loads(self.state_path.read_text())
         self._balance = data["balance"]
-        pos = data.get("position")
-        if pos:
-            pos["opened_at"] = datetime.fromisoformat(pos["opened_at"])
-            self._position = Position(**pos)
+        self._position = position_from_dict(data.get("position"))
 
     def _save(self) -> None:
         data = {
             "balance": self._balance,
-            "position": None,
+            "position": position_to_dict(self._position),
         }
-        if self._position:
-            p = asdict(self._position)
-            p["opened_at"] = self._position.opened_at.isoformat()
-            data["position"] = p
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(data, indent=2))
 
@@ -55,6 +53,8 @@ class PaperBroker(Broker):
         return self._position
 
     def open_position(self, side, units, price, stop_loss, take_profit) -> Position:
+        if side == "short":
+            raise ValueError(f"{self.__class__.__name__} is long-only and cannot open a short position")
         if self._position is not None:
             raise RuntimeError("Position already open; close it before opening a new one")
         self._position = Position(
@@ -69,7 +69,7 @@ class PaperBroker(Broker):
         if self._position is None:
             return None
         pos = self._position
-        pnl = self._calc_pnl(pos, price)
+        pnl = (price - pos.entry_price) * pos.units
         self._balance += pnl
         trade = ClosedTrade(
             side=pos.side, units=pos.units, entry_price=pos.entry_price,
@@ -84,20 +84,8 @@ class PaperBroker(Broker):
         pos = self._position
         if pos is None:
             return None
-        if pos.side == "long":
-            if pos.stop_loss is not None and current_price <= pos.stop_loss:
-                return self.close_position(pos.stop_loss, "stop_loss hit")
-            if pos.take_profit is not None and current_price >= pos.take_profit:
-                return self.close_position(pos.take_profit, "take_profit hit")
-        else:
-            if pos.stop_loss is not None and current_price >= pos.stop_loss:
-                return self.close_position(pos.stop_loss, "stop_loss hit")
-            if pos.take_profit is not None and current_price <= pos.take_profit:
-                return self.close_position(pos.take_profit, "take_profit hit")
+        if pos.stop_loss is not None and current_price <= pos.stop_loss:
+            return self.close_position(pos.stop_loss, "stop_loss hit")
+        if pos.take_profit is not None and current_price >= pos.take_profit:
+            return self.close_position(pos.take_profit, "take_profit hit")
         return None
-
-    @staticmethod
-    def _calc_pnl(pos: Position, exit_price: float) -> float:
-        if pos.side == "long":
-            return (exit_price - pos.entry_price) * pos.units
-        return (pos.entry_price - exit_price) * pos.units

@@ -1,18 +1,16 @@
-import numpy as np
 import pandas as pd
 import pytest
 
 from gold_bot.config import StrategyConfig
-from gold_bot.strategy import Action, EmaRsiAtrStrategy, atr, ema, rsi
+from gold_bot.strategy import Action, EmaAtrStrategy, atr, ema, rsi
 
 
-def make_strategy() -> EmaRsiAtrStrategy:
+def make_strategy() -> EmaAtrStrategy:
     cfg = StrategyConfig(
-        fast_ema=3, slow_ema=6, rsi_period=5,
-        rsi_overbought=70, rsi_oversold=30,
+        fast_ema=3, slow_ema=6,
         atr_period=5, stop_loss_atr_mult=1.5, take_profit_atr_mult=3.0,
     )
-    return EmaRsiAtrStrategy(cfg)
+    return EmaAtrStrategy(cfg)
 
 
 def make_df(closes: list[float]) -> pd.DataFrame:

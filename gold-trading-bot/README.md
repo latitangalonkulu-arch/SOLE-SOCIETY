@@ -1,39 +1,64 @@
-# Gold Trading Bot (XAU/USD)
+# Gold Trading Bot (PAXG via CCXT)
 
-An automated bot that generates entry/exit signals on gold and executes
-them through a pluggable broker backend, with push notifications to your
-phone on every trade. **Starts in paper (simulated) trading mode — no
-real money at risk** until you deliberately switch it to live.
+An automated bot that generates entry/exit signals on tokenized gold
+(PAXG, an ERC-20 token backed 1:1 by physical gold) and executes them on
+a crypto exchange through [CCXT](https://github.com/ccxt/ccxt), with push
+notifications to your phone on every trade. **Starts in paper (simulated)
+trading mode — no real money at risk** until you deliberately switch it
+to live.
 
-> ⚠️ **Risk disclaimer**: trading leveraged gold CFDs can lose money fast.
-> This bot is a starting framework, not a proven profitable strategy.
-> Backtest and paper-trade for a meaningful stretch of time before ever
-> pointing it at a funded live account, and never risk money you can't
-> afford to lose.
+> ⚠️ **Risk disclaimer**: trading can lose money fast. This bot is a
+> starting framework, not a proven profitable strategy. Backtest and
+> paper-trade for a meaningful stretch of time before ever pointing it at
+> a funded live account, and never risk money you can't afford to lose.
+
+> **Long/flat only**: PAXG is traded spot on most exchanges, and spot
+> accounts can't short without margin/futures (which this bot doesn't
+> use). The bot only ever goes long or stays flat — short signals are
+> computed by the strategy but skipped before any order is placed.
 
 ## How it works
 
 ```
-price feed  ->  strategy (EMA cross + RSI filter + ATR stop/target)
-            ->  risk manager (position sizing, daily loss kill-switch)
-            ->  broker (paper simulator today, MT5 adapter for later)
-            ->  trade journal (CSV) + push notification to your phone
+price feed (ccxt)
+    -> strategy: EMA crossover decides direction, ATR sets stop/target
+    -> pre-trade filter: entry only placed if ALL of these pass:
+         1. higher-timeframe trend alignment
+         2. RSI not overbought/oversold
+         3. current-bar volume spike vs its recent average
+    -> risk manager: position sizing, daily loss kill-switch
+    -> broker: paper simulator (default) or real CCXT orders
+    -> trade journal (CSV) + push notification to your phone
 ```
 
-- **Strategy** (`gold_bot/strategy.py`): enters long when the fast EMA
-  crosses above the slow EMA (and RSI isn't overbought), enters short on
-  the opposite crossover (RSI not oversold). Stop-loss/take-profit are set
-  from ATR at entry. Exits early if the EMA crosses back the other way.
+- **Strategy** (`gold_bot/strategy.py`): pure EMA-crossover direction —
+  long when the fast EMA crosses above the slow EMA, short (skipped live)
+  on the opposite cross. Stop-loss/take-profit are set from ATR at entry.
+  Exits early if the EMA crosses back the other way — exits are never
+  blocked by the pre-trade filter below, only entries are.
+- **Pre-trade filter** (`gold_bot/pretrade_filter.py`): the gate requested
+  — before any entry signal becomes a real order, it must pass trend
+  alignment on a higher timeframe, an RSI check, and a volume-spike check,
+  all independently configurable in `config.yaml` under `pretrade_filter:`
+  so you can tune them against paper-trading/backtest results without
+  touching the entry logic itself. A rejected signal is logged and pushed
+  to your phone with the exact reason(s) it failed, so you can see what to
+  loosen/tighten.
 - **Risk manager** (`gold_bot/risk.py`): sizes every trade to risk a fixed
   % of equity (default 1%) based on entry-to-stop distance, caps
   concurrent positions, and halts new trades for the day after a 3%
   equity drawdown.
 - **Broker** (`gold_bot/broker/`): `PaperBroker` simulates fills with a
-  virtual balance persisted to `data/paper_state.json`. `MT5Broker` is a
-  real adapter for MetaTrader 5 — see "Going live" below.
+  virtual balance persisted to `data/paper_state.json`. `CCXTBroker`
+  places real market orders on your exchange. Both are long-only, so
+  paper trading validates exactly what live trading will be able to do.
+  Stop-loss/take-profit are tracked locally and enforced by the engine
+  polling and firing a market sell when breached — not a broker-side OCO
+  order, so protection only works while this process is running.
 - **Notifications** (`gold_bot/notifier/`): pushes an alert to your phone
-  on every entry and exit via [ntfy.sh](https://ntfy.sh) (free, no
-  account). Telegram is also supported if you'd rather use that.
+  on every entry, skipped signal, and exit via
+  [ntfy.sh](https://ntfy.sh) (free, no account). Telegram is also
+  supported if you'd rather use that.
 - **Journal** (`gold_bot/journal.py`): every closed trade is appended to
   `data/trades.csv` so you can review performance from your phone (any
   spreadsheet/file-viewer app opens a CSV).
@@ -54,65 +79,72 @@ Edit `.env`:
    same topic name, and you'll get a push notification for every trade.
 3. Leave `BROKER=paper` for now.
 
-Tune strategy/risk parameters in `config.yaml` if you want (defaults are
-reasonable but arbitrary — nothing here is tuned/optimized for gold
-specifically).
+Check `config.yaml`:
+- `symbol.exchange_id` / `symbol.symbol` — confirm the exchange you plan
+  to eventually trade on actually lists that pair (e.g. Binance lists
+  `PAXG/USDT`; verify for whichever exchange you use).
+- `pretrade_filter.*` — the defaults are a reasonable starting point, not
+  tuned for you. Expect to adjust `higher_timeframe`,
+  `volume_spike_multiplier`, and the RSI bounds after reviewing paper
+  trades and backtests.
 
 ## Running it
 
-**Backtest first** — see how the strategy would have performed on recent
-history before trusting it with anything, even paper money:
+**Backtest first** — see how the strategy + pre-trade filter would have
+performed on recent history before trusting it with anything, even paper
+money:
 
 ```bash
-python -m gold_bot.cli backtest --period 60d --interval 5m
+python -m gold_bot.cli backtest --interval 15m
+python -m gold_bot.cli backtest --interval 15m --no-filter   # compare with the filter off
 ```
 
-**Then run paper trading** (simulated fills, real market data, no real
-money):
+(Capped at ~1000 bars per run — a single exchange API call's worth of
+history. Good enough to sanity-check and tune thresholds, not a full
+historical research pipeline.)
+
+**Then run paper trading** (simulated fills, real market data from the
+exchange's public API, no real money, no API keys needed):
 
 ```bash
 python -m gold_bot.cli run
 ```
 
 This polls the price feed every `engine.poll_interval_seconds` (default
-60s), evaluates the strategy, and opens/closes simulated positions. Leave
-it running (e.g. in `tmux`, or as a systemd service / background process
-on a small VPS or always-on machine — a cellphone itself can't run a
-background Python process reliably, so this is meant to run on a server
-and just *notify* your phone). Check in anytime from your phone via the
-ntfy push alerts, or:
+60s), evaluates the strategy and pre-trade filter, and opens/closes
+simulated positions. Leave it running (e.g. in `tmux`, or as a systemd
+service / background process on a small always-on VPS — a cellphone
+itself can't reliably host a background Python process, so this is meant
+to run on a server and just *notify* your phone). Check in anytime via
+the ntfy push alerts, or:
 
 ```bash
 python -m gold_bot.cli status
 ```
 
-## Going live (MetaTrader 5)
+## Going live (CCXT)
 
 This is the highest-risk step — real orders, real money. Only do this
-after you've validated the strategy in backtest + paper mode and are
-comfortable with the risk settings in `config.yaml`.
+after you've validated the strategy + filter in backtest and paper mode,
+and are comfortable with the risk settings in `config.yaml`.
 
-1. You need a broker account that supports gold (XAU/USD) CFDs and offers
-   MetaTrader 5, plus a Windows machine or Windows VPS to run the MT5
-   terminal (the `MetaTrader5` Python package talks to a **local, running,
-   logged-in terminal** — it is not a remote API, so this cannot run from
-   this cloud container or from your phone directly).
-2. On that machine: install and log into the MT5 terminal, then
-   `pip install MetaTrader5`.
-3. In `.env`, set `BROKER=mt5` and fill in `MT5_LOGIN`, `MT5_PASSWORD`,
-   `MT5_SERVER`, `MT5_SYMBOL` (the broker's exact gold symbol, e.g.
-   `XAUUSD`).
+1. Open an account on an exchange that lists PAXG (check `symbol.symbol`
+   in `config.yaml` matches what that exchange actually calls the pair).
+2. Create API keys scoped to **spot trading only — no withdrawal
+   permission**.
+3. In `.env`, set `BROKER=ccxt`, `CCXT_API_KEY`, `CCXT_API_SECRET`, and
+   `CCXT_API_PASSWORD` if your exchange requires one (OKX, KuCoin, ...).
 4. Run with the explicit live flag — this is a deliberate safety check,
    the bot refuses to place real orders without it:
    ```bash
    python -m gold_bot.cli run --live
    ```
 
-Stop-loss and take-profit are attached to the order itself, so the
-broker's servers enforce them even if this process or your network drops
-— it doesn't rely on the bot staying online to protect you, but a dead
-bot process also won't open any *new* trades or manage anything beyond
-the fixed SL/TP.
+Unlike a broker-side OCO order, stop-loss/take-profit here are enforced
+by this process polling and firing a real market sell once breached — if
+the bot stops running, an open position's SL/TP will NOT be enforced by
+the exchange on its own. Keep the process supervised (systemd restart
+policy, a monitoring alert, etc.) if you go live.
 
 ## Tests
 
@@ -121,18 +153,23 @@ pip install pytest
 python -m pytest
 ```
 
-16 unit tests cover the strategy's indicator math and signal logic, risk
-sizing/kill-switch, and the paper broker's fill/PnL/persistence behavior.
+27 unit tests cover: strategy indicator math and crossover signal logic;
+the pre-trade filter's trend/RSI/volume checks (including rejection
+reasons); risk sizing and the daily-loss kill-switch; the paper broker's
+fill/PnL/persistence behavior and long-only constraint; and the CCXT
+broker's order placement, equity mark-to-market, and SL/TP enforcement
+(exercised against a fake exchange client, so no real credentials or
+network are needed to run the suite).
 
 ## Notes / limitations
 
-- The paper broker's data feed (`yfinance`) is free and keyless but can
-  lag real-time by minutes and occasionally rate-limits — fine for
-  validating logic, not a substitute for your live broker's real feed.
-- The strategy is intentionally simple (EMA/RSI/ATR) and unoptimized. Treat
-  it as a framework to iterate on, not a finished edge.
+- The data feed (`ccxt` public endpoints) is free and keyless but can be
+  rate-limited — fine for validating logic, not a guarantee of your live
+  exchange's exact fill conditions.
+- The strategy is intentionally simple (EMA/ATR) and unoptimized; the
+  pre-trade filter is the main lever for being pickier about entries.
+  Treat both as a framework to iterate on, not a finished edge.
+- Long/flat only, as noted above — no margin, no futures, no shorting.
 - There's no web/mobile dashboard here — "mobile" access is via push
   notifications (ntfy/Telegram) plus `cli status` from wherever the bot
-  runs. If you later want an interactive phone dashboard, the engine/
-  broker/journal modules are already decoupled enough to put a small web
-  UI in front of them.
+  runs.

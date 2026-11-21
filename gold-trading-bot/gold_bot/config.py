@@ -13,7 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class SymbolConfig:
-    yfinance_ticker: str
+    exchange_id: str  # ccxt exchange id, e.g. "binance", "kraken"
+    symbol: str  # ccxt market symbol, e.g. "PAXG/USDT"
     display_name: str
 
 
@@ -21,12 +22,26 @@ class SymbolConfig:
 class StrategyConfig:
     fast_ema: int
     slow_ema: int
-    rsi_period: int
-    rsi_overbought: float
-    rsi_oversold: float
     atr_period: int
     stop_loss_atr_mult: float
     take_profit_atr_mult: float
+
+
+@dataclass(frozen=True)
+class PreTradeFilterConfig:
+    """Independent confirmation gate applied before any entry is placed.
+
+    Kept separate from StrategyConfig so these thresholds can be tuned
+    against paper-trading results without touching entry-signal logic.
+    """
+    enabled: bool
+    higher_timeframe: str  # ccxt timeframe string, e.g. "1h"
+    higher_timeframe_ema_period: int
+    rsi_period: int
+    rsi_overbought: float
+    rsi_oversold: float
+    volume_lookback: int
+    volume_spike_multiplier: float
 
 
 @dataclass(frozen=True)
@@ -53,18 +68,18 @@ class NotifierConfig:
 
 @dataclass(frozen=True)
 class BrokerConfig:
-    backend: str  # "paper" | "mt5"
+    backend: str  # "paper" | "ccxt"
     paper_starting_balance: float
-    mt5_login: int | None
-    mt5_password: str | None
-    mt5_server: str | None
-    mt5_symbol: str | None
+    ccxt_api_key: str | None
+    ccxt_api_secret: str | None
+    ccxt_api_password: str | None  # some exchanges (OKX, KuCoin, ...) require this
 
 
 @dataclass(frozen=True)
 class AppConfig:
     symbol: SymbolConfig
     strategy: StrategyConfig
+    pretrade_filter: PreTradeFilterConfig
     risk: RiskConfig
     engine: EngineConfig
     notifier: NotifierConfig
@@ -78,11 +93,10 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
 
-    mt5_login_raw = os.getenv("MT5_LOGIN")
-
     return AppConfig(
         symbol=SymbolConfig(**raw["symbol"]),
         strategy=StrategyConfig(**raw["strategy"]),
+        pretrade_filter=PreTradeFilterConfig(**raw["pretrade_filter"]),
         risk=RiskConfig(**raw["risk"]),
         engine=EngineConfig(**raw["engine"]),
         notifier=NotifierConfig(
@@ -94,9 +108,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         broker=BrokerConfig(
             backend=os.getenv("BROKER", "paper"),
             paper_starting_balance=float(os.getenv("PAPER_STARTING_BALANCE", "10000")),
-            mt5_login=int(mt5_login_raw) if mt5_login_raw else None,
-            mt5_password=os.getenv("MT5_PASSWORD") or None,
-            mt5_server=os.getenv("MT5_SERVER") or None,
-            mt5_symbol=os.getenv("MT5_SYMBOL") or None,
+            ccxt_api_key=os.getenv("CCXT_API_KEY") or None,
+            ccxt_api_secret=os.getenv("CCXT_API_SECRET") or None,
+            ccxt_api_password=os.getenv("CCXT_API_PASSWORD") or None,
         ),
     )

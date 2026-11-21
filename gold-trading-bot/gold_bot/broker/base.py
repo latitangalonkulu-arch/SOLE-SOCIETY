@@ -28,6 +28,11 @@ class ClosedTrade:
 
 
 class Broker(ABC):
+    #: Spot exchanges (CCXT against most crypto exchanges, e.g. for PAXG)
+    #: can't short without margin/futures, which this bot doesn't use.
+    #: Override to True only for a broker that actually supports it.
+    supports_short: bool = True
+
     @abstractmethod
     def get_equity(self) -> float: ...
 
