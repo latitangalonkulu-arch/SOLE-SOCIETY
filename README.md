@@ -7,3 +7,11 @@
 Operations Assistant for Mining Companies* pilot proposal (automated shift
 reports for mine supervisors/managers). See its own README for setup and a
 demo script.
+
+`gold-trading-bot/` is another unrelated project: an automated gold
+(PAXG, tokenized gold) trading bot using CCXT, with a pre-trade filter
+(higher-timeframe trend, RSI, volume spike) gating entries, risk-based
+position sizing, a paper-trading simulator (default) plus real order
+execution for going live later, and push notifications to your phone on
+every trade. See its own README for setup, backtesting, and the risk
+disclaimer.

@@ -1,0 +1,6 @@
+.env
+data/paper_state.json
+data/trades.csv
+__pycache__/
+*.pyc
+.pytest_cache/
