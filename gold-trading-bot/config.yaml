@@ -1,0 +1,35 @@
+# Default strategy, risk and engine parameters.
+# Edit these to tune behavior without touching code.
+
+symbol:
+  # Yahoo Finance ticker used by the paper data feed.
+  yfinance_ticker: "XAUUSD=X"
+  # Symbol name used for display, journal entries, and the MT5 broker.
+  display_name: "XAU/USD"
+
+strategy:
+  fast_ema: 12
+  slow_ema: 26
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  atr_period: 14
+  stop_loss_atr_mult: 1.5
+  take_profit_atr_mult: 3.0
+
+risk:
+  # Fraction of account equity risked on a single trade (0.01 = 1%).
+  risk_per_trade: 0.01
+  # Max number of concurrent open positions.
+  max_open_positions: 1
+  # Stop trading for the rest of the day once losses reach this fraction
+  # of starting-of-day equity (0.03 = 3%).
+  max_daily_loss_pct: 0.03
+
+engine:
+  # How often to poll the price feed and re-evaluate signals, in seconds.
+  poll_interval_seconds: 60
+  # Bars of history to fetch each poll for indicator calculation.
+  lookback_bars: 300
+  # Bar interval requested from the data feed.
+  bar_interval: "5m"
