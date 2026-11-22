@@ -1,0 +1,225 @@
+// Port of gold_smart_bot.py's rules to a TradingView strategy.
+//
+// Setup:
+//   - Apply this to an XAUUSD chart set to the 15m timeframe (the "Bias
+//     timeframe" input pulls 1H data separately via request.security).
+//   - Running this as a strategy() gives you win rate / profit factor /
+//     equity curve / trade list for free in TradingView's Strategy Tester
+//     tab - no separate dashboard needed.
+//   - qty is computed in the chart symbol's native quantity unit assuming
+//     1 unit x $1 price move = $1 P&L (true for most spot/CFD XAUUSD feeds,
+//     e.g. OANDA:XAUUSD). This is NOT the same unit as an MT5 "lot" (1.0
+//     lot = 100oz on most brokers). Before trusting position sizing, open
+//     one trade in the Strategy Tester's "List of Trades" and check its
+//     displayed P&L against qty x price-move by hand.
+//   - TradingView has no generic historical bid/ask-spread series and no
+//     programmatic economic-calendar feed, so (a) the spread filter from
+//     the Python version is NOT implemented here, and (b) the news filter
+//     is two manually-set blackout windows (below) you fill in yourself
+//     ahead of known NFP/CPI releases - nothing live.
+//   - Unlike gold_smart_bot.py, this script has not been run/compiled by
+//     me (no Pine environment available here) - paste it into TradingView's
+//     Pine Editor and fix anything it flags before relying on it.
+
+//@version=6
+strategy("Smart Gold Bot - XAUUSD", shorttitle="SmartGoldBot", overlay=true,
+     initial_capital=20, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=0.01,
+     pyramiding=0, calc_on_every_tick=false)
+
+// ---------------- inputs ----------------
+
+grpBias = "Bias (1H)"
+biasTF           = input.timeframe("60", "Bias timeframe", group=grpBias)
+emaBiasLen       = input.int(200, "EMA length (bias)", group=grpBias)
+chopAtrMult      = input.float(0.3, "Chop band (x ATR 1H)", step=0.05, group=grpBias)
+
+grpEntry = "Entries (chart TF)"
+emaPullbackLen   = input.int(21, "EMA length (pullback)", group=grpEntry)
+pullbackTolMult  = input.float(0.1, "Pullback touch tolerance (x ATR)", step=0.05, group=grpEntry)
+sweepLookback    = input.int(1, "Sweep lookback bars", minval=1, group=grpEntry)
+
+grpRisk = "Risk"
+riskPct          = input.float(1.0, "Risk % per trade", step=0.1, group=grpRisk) / 100.0
+slMinUsd         = input.float(0.50, "Min SL distance ($)", step=0.05, group=grpRisk)
+slMaxUsd         = input.float(1.00, "Max SL distance ($)", step=0.05, group=grpRisk)
+rewardMultiple   = input.float(2.0, "Reward multiple (R)", step=0.1, group=grpRisk)
+maxTradesPerDay  = input.int(2, "Max trades / day", minval=1, group=grpRisk)
+maxLossesPerDay  = input.int(2, "Max losses / day", minval=1, group=grpRisk)
+minQty           = input.float(0.01, "Min qty (broker floor)", step=0.01, group=grpRisk)
+maxQty           = input.float(0.05, "Max qty (hard cap)", step=0.01, group=grpRisk)
+
+grpExit = "Exits"
+staleHours       = input.float(2.0, "Stale trade age (hours)", group=grpExit)
+staleRThreshold  = input.float(0.2, "Stale if |floating R| <", step=0.05, group=grpExit)
+flattenHour      = input.int(18, "Flatten hour (SA time)", group=grpExit)
+
+grpFilter = "Filters / sessions"
+tz               = input.string("Africa/Johannesburg", "Timezone", group=grpFilter)
+mondayBlockUntil = input.int(10, "Monday: no trades before (hour)", group=grpFilter)
+fridayCutoff     = input.int(16, "Friday: no trades after (hour)", group=grpFilter)
+consecLossLimit  = input.int(2, "Pause after N consecutive losses", group=grpFilter)
+consecLossPauseH = input.float(1.0, "Pause duration (hours)", group=grpFilter)
+
+grpNews = "Manual news blackouts (optional, UTC)"
+news1Start = input.time(timestamp("2020-01-01 00:00"), "Blackout 1 start", group=grpNews)
+news1End   = input.time(timestamp("2020-01-01 00:00"), "Blackout 1 end", group=grpNews)
+news2Start = input.time(timestamp("2020-01-01 00:00"), "Blackout 2 start", group=grpNews)
+news2End   = input.time(timestamp("2020-01-01 00:00"), "Blackout 2 end", group=grpNews)
+
+// ---------------- 1H bias (non-repainting MTF pull) ----------------
+// the [1] on each expression, combined with lookahead_off, guarantees we
+// only ever see the last *closed* 1H bar - never the one still forming.
+
+ema200_1h = request.security(syminfo.tickerid, biasTF, ta.ema(close, emaBiasLen)[1], lookahead=barmerge.lookahead_off)
+close_1h  = request.security(syminfo.tickerid, biasTF, close[1], lookahead=barmerge.lookahead_off)
+atr_1h    = request.security(syminfo.tickerid, biasTF, ta.atr(14)[1], lookahead=barmerge.lookahead_off)
+
+band = atr_1h * chopAtrMult
+bias = close_1h > ema200_1h + band ? 1 : close_1h < ema200_1h - band ? -1 : 0  // 1=BUY -1=SELL 0=FLAT
+
+// ---------------- 15m trend agreement + entries (chart timeframe) ----------------
+
+emaPB = ta.ema(close, emaPullbackLen)
+atr15 = ta.atr(14)
+
+trendAgrees = bias == 1 ? close > emaPB : bias == -1 ? close < emaPB : false
+
+touchTol = atr15 * pullbackTolMult
+pullbackSignal = bias == 1 ? (low[1] <= emaPB[1] + touchTol and close > emaPB and close > open) :
+     bias == -1 ? (high[1] >= emaPB[1] - touchTol and close < emaPB and close < open) : false
+
+refLow  = low[sweepLookback]
+refHigh = high[sweepLookback]
+sweepSignal = bias == 1 ? (low < refLow and close > refLow) :
+     bias == -1 ? (high > refHigh and close < refHigh) : false
+
+hasSignal = sweepSignal or pullbackSignal
+entryLabel = sweepSignal ? "sweep" : "pullback"
+
+// ---------------- sessions / day-of-week (SA local time) ----------------
+
+saHour   = hour(time, tz)
+saMinute = minute(time, tz)
+saDow    = dayofweek(time, tz)
+hm       = saHour * 60 + saMinute
+
+inWindow1 = hm >= 9 * 60  and hm < 12 * 60
+inWindow2 = hm >= 14 * 60 and hm < 18 * 60
+isWeekday = saDow != dayofweek.saturday and saDow != dayofweek.sunday
+mondayBlocked = saDow == dayofweek.monday and saHour < mondayBlockUntil
+fridayBlocked = saDow == dayofweek.friday and saHour >= fridayCutoff
+
+inSession = isWeekday and not mondayBlocked and not fridayBlocked and (inWindow1 or inWindow2)
+newsBlackout = (time >= news1Start and time <= news1End) or (time >= news2Start and time <= news2End)
+
+// ---------------- daily state (persists across bars) ----------------
+
+var int tradesToday     = 0
+var int lossesToday     = 0
+var int consecLosses    = 0
+var float pauseUntilTime = na
+var int lastDateId      = na
+var int lastClosedCount = 0
+
+curDateId = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+if na(lastDateId) or curDateId != lastDateId
+    tradesToday := 0
+    lossesToday := 0
+    consecLosses := 0
+    pauseUntilTime := na
+    lastDateId := curDateId
+
+if strategy.closedtrades > lastClosedCount
+    tradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if tradeProfit < 0
+        lossesToday += 1
+        consecLosses += 1
+        if consecLosses >= consecLossLimit
+            pauseUntilTime := time + consecLossPauseH * 60 * 60 * 1000
+    else
+        consecLosses := 0
+    lastClosedCount := strategy.closedtrades
+
+isPaused = not na(pauseUntilTime) and time < pauseUntilTime
+canTrade = inSession and not newsBlackout and not isPaused and
+     tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay
+
+// ---------------- SL / TP / sizing ----------------
+
+structuralLevel = bias == 1 ? refLow : refHigh
+rawDistance = math.abs(close - structuralLevel)
+slDistance = math.min(math.max(rawDistance, slMinUsd), slMaxUsd)
+
+longSL  = close - slDistance
+longTP  = close + slDistance * rewardMultiple
+shortSL = close + slDistance
+shortTP = close - slDistance * rewardMultiple
+
+riskAmount = strategy.equity * riskPct
+rawQty = slDistance > 0 ? riskAmount / slDistance : minQty
+qty = math.min(math.max(rawQty, minQty), maxQty)
+
+// ---------------- entries (confirmed bars only - avoids intrabar repaint) ----------------
+
+var float entryRiskAmount = na
+var float openBarTime     = na
+
+if barstate.isconfirmed and hasSignal and trendAgrees and canTrade and strategy.position_size == 0
+    if bias == 1
+        strategy.entry("Long", strategy.long, qty=qty)
+        strategy.exit("Long exit", "Long", stop=longSL, limit=longTP)
+        alert("SmartGoldBot BUY (" + entryLabel + ") qty=" + str.tostring(qty), alert.freq_once_per_bar_close)
+        tradesToday += 1
+        entryRiskAmount := riskAmount
+    else if bias == -1
+        strategy.entry("Short", strategy.short, qty=qty)
+        strategy.exit("Short exit", "Short", stop=shortSL, limit=shortTP)
+        alert("SmartGoldBot SELL (" + entryLabel + ") qty=" + str.tostring(qty), alert.freq_once_per_bar_close)
+        tradesToday += 1
+        entryRiskAmount := riskAmount
+
+// ---------------- stale / end-of-day exits ----------------
+
+if strategy.position_size != 0 and na(openBarTime)
+    openBarTime := time
+if strategy.position_size == 0
+    openBarTime := na
+    entryRiskAmount := na
+
+ageHours = na(openBarTime) ? 0 : (time - openBarTime) / 3600000.0
+floatingR = (not na(entryRiskAmount) and entryRiskAmount > 0) ? strategy.openprofit / entryRiskAmount : 0.0
+isStale = ageHours >= staleHours and math.abs(floatingR) < staleRThreshold
+flattenNow = saHour >= flattenHour
+
+if strategy.position_size != 0 and (isStale or flattenNow)
+    strategy.close_all(comment = flattenNow ? "18:00 flatten" : "stale")
+
+// ---------------- visuals ----------------
+
+plot(ema200_1h, "EMA200 (1H)", color=color.orange, linewidth=2)
+plot(emaPB, "EMA21 (15m)", color=color.blue)
+
+plotshape(barstate.isconfirmed and sweepSignal and bias == 1, title="Sweep BUY", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(barstate.isconfirmed and sweepSignal and bias == -1, title="Sweep SELL", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(barstate.isconfirmed and pullbackSignal and bias == 1, title="Pullback BUY", style=shape.circle, location=location.belowbar, color=color.lime, size=size.tiny)
+plotshape(barstate.isconfirmed and pullbackSignal and bias == -1, title="Pullback SELL", style=shape.circle, location=location.abovebar, color=color.maroon, size=size.tiny)
+
+bgcolor(inSession ? color.new(color.green, 92) : color.new(color.gray, 95))
+
+var table dash = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Bias", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 0, bias == 1 ? "BUY" : bias == -1 ? "SELL" : "FLAT", text_color=color.white, bgcolor=bias == 1 ? color.green : bias == -1 ? color.red : color.gray)
+    table.cell(dash, 0, 1, "Session", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 1, inSession ? "OPEN" : "CLOSED", text_color=color.white, bgcolor=inSession ? color.green : color.red)
+    table.cell(dash, 0, 2, "Trades today", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 2, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), text_color=color.white, bgcolor=color.navy)
+    table.cell(dash, 0, 3, "Losses today", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 3, str.tostring(lossesToday) + " / " + str.tostring(maxLossesPerDay), text_color=color.white, bgcolor=color.navy)
+    table.cell(dash, 0, 4, "Consec. losses", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 4, str.tostring(consecLosses), text_color=color.white, bgcolor=color.navy)
+    table.cell(dash, 0, 5, "Paused", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 5, isPaused ? "YES" : "no", text_color=color.white, bgcolor=isPaused ? color.red : color.navy)
+    table.cell(dash, 0, 6, "Win rate", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 6, strategy.closedtrades > 0 ? str.tostring(math.round(strategy.wintrades / strategy.closedtrades * 100)) + "%" : "n/a", text_color=color.white, bgcolor=color.navy)
